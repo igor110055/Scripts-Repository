@@ -1,0 +1,198 @@
+import boto3
+import sys
+import time
+from botocore.exceptions import ClientError
+
+def get_emr_client(region, tries=1):
+    '''Get EMR Client'''
+    try:
+        return boto3.client('emr', region_name=region)
+    except ClientError as exception_obj:
+        if exception_obj.response['Error']['Code'] == 'ThrottlingException':
+            if tries <= 3:
+                print("Throttling Exception Occured.")
+                print("Retrying.....")
+                print("Attempt No.: " + str(tries)) 
+                time.sleep(3)
+                return get_emr_client(tries + 1)
+            else:
+                print("Attempted 3 Times But No Success.")
+                print("Raising Exception.....")
+                raise
+        else:
+            raise
+
+def lambda_handler(event, context):
+    lastFile = event['Records'][0]['s3']['object']['key']
+    emr_client = get_emr_client('us-east-1')
+
+    cluster_id = emr_client.run_job_flow(
+        Name='Pipe-EMR-AllianceExport',
+        LogUri='s3://zw-airflow-logs/logs/emr_ingestion/task/',
+        ServiceRole='EMR_DefaultRole',
+        JobFlowRole='EMR_EC2_DefaultRole',
+        VisibleToAllUsers=True,
+        ReleaseLabel='emr-6.3.0',
+        Tags = [
+                {"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}
+            ],
+        Instances={
+            'InstanceGroups': [
+                 {
+                    'Name': 'Master node',
+                    'Market': 'ON_DEMAND',
+                    'InstanceRole': 'MASTER',
+                    'InstanceType': 'r5.xlarge',
+                    'InstanceCount': 1,
+                },
+                {
+                    'Name': "Worker nodes",
+                    'Market': 'ON_DEMAND',
+                    'InstanceRole': 'CORE',
+                    'InstanceType': 'r5.xlarge',
+                    'InstanceCount': 3,
+                }
+            ],
+            'Ec2KeyName': 'buster',
+            'KeepJobFlowAliveWhenNoSteps': False,
+            'TerminationProtected': False,
+            "Placement":
+            {
+                "AvailabilityZone":"us-east-1d"
+            },
+        },
+        Applications=[
+            {'Name': 'Hadoop'},
+            {'Name': 'Hive'},
+            {'Name': 'Spark'}
+        ],
+        Configurations=[
+            {
+                "Classification":"hive-site",
+                "Properties":{
+                    "hive.metastore.client.factory.class":"com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory"
+                },
+                    "Configurations":[]
+            },
+            {
+                "Classification":"presto-connector-hive",
+                "Properties":{
+                    "hive.metastore.glue.datacatalog.enabled":"true"
+                },
+                "Configurations":[]
+            },
+            {
+                "Classification":"spark-hive-site",
+                "Properties":{
+                    "hive.metastore.client.factory.class":"com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory"
+                },
+                "Configurations":[
+                ]
+            },
+            {
+                "Classification":"spark-defaults",
+                "Properties":{
+                    "spark.serializer":"org.apache.spark.serializer.KryoSerializer",
+                    "spark.sql.legacy.parquet.datetimeRebaseModeInRead":"CORRECTED"
+                    }
+            }
+        ],
+        
+        Steps=[
+            {
+                "Name": "Redshift JAR",
+                'ActionOnFailure': 'TERMINATE_CLUSTER',
+                'HadoopJarStep': {
+                    'Jar': 's3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar',
+                    "Args": ['s3://emr-scripts-pex/auto/retrieve_jar.sh']
+                }
+            },
+            {
+                "Name": "PIPE ONE",
+                "ActionOnFailure": "TERMINATE_CLUSTER",
+                "HadoopJarStep": {
+                    "Jar": "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "Args": ['s3://emr-scripts-pex/auto/pex_run.sh',
+                            's3://emr-scripts-pex/runner/dev/emr_ingestion.pex',
+                            'HADOOP_HOME=/usr/lib/hadoop',
+                            'SPARK_HOME=/usr/lib/spark',
+                            './emr_ingestion.pex',
+                            '-m',
+                            'emr_ingestion.main',
+                            '--exporterAliansce1',
+                            'run',
+                            '--lastFile ' + lastFile]
+                }
+            },
+            {
+                "Name": "PIPE TWO",
+                "ActionOnFailure": "TERMINATE_CLUSTER",
+                "HadoopJarStep": {
+                    "Jar": "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "Args": ['s3://emr-scripts-pex/auto/pex_run.sh',
+                            's3://emr-scripts-pex/runner/dev/emr_ingestion.pex',
+                            'HADOOP_HOME=/usr/lib/hadoop',
+                            'SPARK_HOME=/usr/lib/spark',
+                            './emr_ingestion.pex',
+                            '-m',
+                            'emr_ingestion.main',
+                            '--exporterAliansce2',
+                            'run',
+                            '--lastFile ' + lastFile]
+                }
+            },
+            {
+                "Name": "PIPE THREE",
+                "ActionOnFailure": "TERMINATE_CLUSTER",
+                "HadoopJarStep": {
+                    "Jar": "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "Args": ['s3://emr-scripts-pex/auto/pex_run.sh',
+                            's3://emr-scripts-pex/runner/dev/emr_ingestion.pex',
+                            'HADOOP_HOME=/usr/lib/hadoop',
+                            'SPARK_HOME=/usr/lib/spark',
+                            './emr_ingestion.pex',
+                            '-m',
+                            'emr_ingestion.main',
+                            '--exporterAliansce3',
+                            'run',
+                            '--lastFile ' + lastFile]
+                }
+            },
+            {
+                "Name": "PIPE FOUR",
+                "ActionOnFailure": "TERMINATE_CLUSTER",
+                "HadoopJarStep": {
+                    "Jar": "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "Args": ['s3://emr-scripts-pex/auto/pex_run.sh',
+                            's3://emr-scripts-pex/runner/dev/emr_ingestion.pex',
+                            'HADOOP_HOME=/usr/lib/hadoop',
+                            'SPARK_HOME=/usr/lib/spark',
+                            './emr_ingestion.pex',
+                            '-m',
+                            'emr_ingestion.main',
+                            '--exporterAliansce4',
+                            'run',
+                            '--lastFile ' + lastFile]
+                }
+            },
+            {
+                "Name": "PIPE FIVE",
+                "ActionOnFailure": "TERMINATE_CLUSTER",
+                "HadoopJarStep": {
+                    "Jar": "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "Args": ['s3://emr-scripts-pex/auto/pex_run.sh',
+                            's3://emr-scripts-pex/runner/dev/emr_ingestion.pex',
+                            'HADOOP_HOME=/usr/lib/hadoop',
+                            'SPARK_HOME=/usr/lib/spark',
+                            './emr_ingestion.pex',
+                            '-m',
+                            'emr_ingestion.main',
+                            '--exporterAliansce5',
+                            'run',
+                            '--lastFile ' + lastFile]
+                }
+            }
+        ]
+    )
+
+    print("Started cluster {}".format(cluster_id))

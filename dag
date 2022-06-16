@@ -1,0 +1,169 @@
+from airflow.models.baseoperator import ScheduleInterval
+from airflow.utils.dates import days_ago
+from airflow.decorators import dag as decorator_dag
+from airflow.decorators import task as decorator_task
+from typing import Dict
+import boto3
+
+default_args = {
+    'start_date': days_ago(1),
+}
+
+connection = boto3.client(
+    'emr',
+    region_name='us-east-1'
+)
+
+
+@decorator_dag(schedule_interval='@daily', default_args=default_args, catchup=False)
+def emr_not_opt_in_datahub():
+    @decorator_task
+    def create_cluster() -> str:
+        cluster_id = connection.run_job_flow(
+            Name='Pipe-EMR-Socio',
+            LogUri='s3://zw-airflow-logs/logs/emr-ingestion/task/',
+            ServiceRole='EMR_DefaultRole',
+            JobFlowRole='EMR_EC2_DefaultRole',
+            VisibleToAllUsers=True,
+            ReleaseLabel='emr-6.2.0',
+            Instances={
+                'InstanceGroups': [
+                    {
+                        'Name': 'Master node',
+                        'Market': 'ON_DEMAND',
+                        'InstanceRole': 'MASTER',
+                        'InstanceType': 'r5.xlarge',
+                        'InstanceCount': 1,
+                    },
+                    {
+                        'Name': "Worker nodes",
+                        'Market': 'ON_DEMAND',
+                        'InstanceRole': 'CORE',
+                        'InstanceType': 'r5.xlarge',
+                        'InstanceCount': 2,
+                    }
+                ],
+                'Ec2KeyName': 'buster',
+                'KeepJobFlowAliveWhenNoSteps': False,
+                'TerminationProtected': False
+            },
+            Applications=[
+                {'Name': 'Hadoop'},
+                {'Name': 'Hive'},
+                {'Name': 'Spark'}
+            ],
+
+            Configurations=[
+                {
+                    "Classification": "hive-site",
+                    "Properties": {
+                        "hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory"
+                    },
+                    "Configurations": []
+                },
+                {
+
+                    "Classification": "presto-connector-hive",
+                    "Properties": {
+                        "hive.metastore.glue.datacatalog.enabled": "true"
+                    },
+                    "Configurations": [
+                    ]
+                },
+                {
+                    "Classification": "spark-hive-site",
+                    "Properties": {
+                        "hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory"
+                    },
+                    "Configurations": [
+                    ]
+                },
+                {
+                    "Classification": "spark-defaults",
+                    "Properties": {
+                        "spark.jars": "/usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar"
+                    }
+                },
+                {
+                    "Classification": "hadoop-env",
+                    "Properties": {
+
+                    },
+                    "Configurations": [
+                        {
+                            "Classification": "export",
+                            "Properties": {
+                                "PYSPARK_PYTHON": "python3",
+                                "PYSPARK_DRIVER_PYTHON": "python3"
+                            },
+                            "Configurations": []
+                        }],
+                }
+            ],
+            Tags=[
+                {"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"},
+                {"Key": "owner", "Value": "airflow"}
+            ]
+        )
+
+        return cluster_id["JobFlowId"]
+
+    @decorator_task
+    def add_step(cluster_id: str) -> str:
+        steps = [
+            {
+                "Name": "Redshift JAR",
+                'ActionOnFailure': 'TERMINATE_CLUSTER',
+                'HadoopJarStep': {
+                    'Jar': 's3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar',
+                    "Args": ['s3://emr-scripts-pex/auto/retrieve_jar.sh']
+                }
+            },
+            {
+                "Name": "START PIPE",
+                "ActionOnFailure": "TERMINATE_CLUSTER",
+                "HadoopJarStep": {
+                    "Jar": "s3://us-east-1.elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "Args": ['s3://emr-scripts-pex/auto/pex_run.sh',
+                             's3://emr-scripts-pex/runner/dev/emr_ingestion.pex',
+                             'HADOOP_HOME=/usr/lib/hadoop',
+                             'SPARK_HOME=/usr/lib/spark',
+                             './emr_ingestion.pex',
+                             '-m',
+                             'emr_ingestion.main',
+                             '--ingestSocio',
+                             'run']
+                }
+            }
+        ]
+
+        connection.add_job_flow_steps(JobFlowId=cluster_id, Steps=steps)
+
+        return cluster_id
+
+    @decorator_task
+    def watch_step(cluster_id: str) -> str:
+        waiter = connection.get_waiter("step_complete")
+
+        response = connection.list_steps(ClusterId=cluster_id)
+
+        for step in response["Steps"]:
+            waiter.wait(
+                ClusterId=cluster_id,
+                StepId=step["Id"],
+                WaiterConfig={
+                    "Delay": 30
+                }
+            )
+        return cluster_id
+
+    @decorator_task
+    def terminate_cluster(cluster_id: str):
+        connection.terminate_job_flows(JobFlowIds=[cluster_id])
+
+    terminate_cluster(watch_step(add_step(create_cluster())))
+
+
+dag = emr_not_opt_in_datahub()
+
+
